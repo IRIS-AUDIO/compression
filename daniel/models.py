@@ -63,10 +63,10 @@ class QALinear(nn.Module):
 
         return inputs @ weight + bias
 
-    def rounding(self, inputs, axis=-1):
+    def rounding(self, inputs, axis=-1, minvalue=1e-8):
         min_value = torch.amin(inputs, axis, keepdims=True)
         max_value = torch.amax(inputs, axis, keepdims=True)
-        scale = (max_value - min_value) / (self.n_bits**2 - 1)
+        scale = (max_value - min_value).clamp(min=minvalue) / (self.n_bits**2 - 1)
 
         return torch.round((inputs - min_value) / scale) * scale + min_value
 

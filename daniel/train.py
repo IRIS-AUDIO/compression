@@ -12,7 +12,6 @@ from sympy.solvers import solve
 
 from metrics import *
 from models import *
-from dct import dct
 
 
 parser = argparse.ArgumentParser()
