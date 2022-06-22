@@ -12,6 +12,7 @@ from sympy.solvers import solve
 
 from metrics import *
 from models import *
+from dct import dct
 
 
 parser = argparse.ArgumentParser()
@@ -35,12 +36,14 @@ parser.add_argument('--hidden_dim', type=int, default=48)
 parser.add_argument('--kbps', type=float, default=None)
 parser.add_argument('--activation', type=str, default='gelu')
 parser.add_argument('--n_bits', type=int, default=8)
+parser.add_argument('--target_sr', type=int, default=None)
 
 # General training setups
-parser.add_argument('--batch_size', type=int, default=5000)
+parser.add_argument('--batch_size', type=int, default=7500)
 parser.add_argument('--epochs', type=int, default=1000)
-parser.add_argument('--lr', type=float, default=0.0001)
+parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--grad_clip', type=float, default=1.)
+parser.add_argument('--debug', action='store_true')
 
 # evaluation parameters
 parser.add_argument('--eval_freq', type=int, default=1000)
@@ -58,6 +61,10 @@ def get_cos_warmup_scheduler(optimizer, total_epoch, warmup_epoch):
 def train(args):
     # 1. audio and grids
     audio, rate = torchaudio.load(args.audio)
+    # resample
+    if args.target_sr is not None:
+        audio = torchaudio.functional.resample(audio, rate, args.target_sr)
+        rate = args.target_sr
     audio = audio.T # to [n_samples, channels]
 
     # 1.1 audio trimimng
@@ -72,16 +79,11 @@ def train(args):
     audio = audio / audio.abs().amax()
 
     # 1.3 make inputs
-    n_channels = int(np.ceil(np.log(len(audio)) / np.log(2)))
-    grids = torch.linspace(0, len(audio)-1, len(audio))
-    grids = torch.stack([(grids % (2**(i+1))) / (2**(i+1)-1)
-                         for i in range(n_channels)], -1) * 2 - 1
-    '''
     # original POS ENC
+    n_channels = int(np.ceil(np.log(len(audio)) / np.log(2)))
     grids = torch.linspace(-1, 1, len(audio))
     grids = torch.stack([np.pi * grids * (2**i) for i in range(n_channels)], -1)
     grids = torch.cat([torch.cos(grids), torch.sin(grids)], -1)
-    '''
     grids = grids.cuda()
     print(grids.shape)
 
@@ -96,7 +98,9 @@ def train(args):
         in_dim = grids.shape[-1]
 
         eq = 64 * (args.n_hidden_layers + 2) * (args.n_bits != 16) \
-           + args.n_bits * (in_dim + (in_dim + args.n_hidden_layers * (x+1) + args.upscale + 1) * x) - target_size
+           + args.n_bits * (in_dim + (in_dim + args.n_hidden_layers * (x+1)
+                                      + args.upscale + 1) * x) \
+           - target_size
         args.hidden_dim = int(np.round(float(max(solve(eq)))/2)*2)
         print(f'width: {args.hidden_dim}')
 
@@ -104,20 +108,16 @@ def train(args):
                  n_hidden_layers=args.n_hidden_layers,
                  hidden_dim=args.hidden_dim, activation=args.activation,
                  n_bits=args.n_bits)
-    # model = Siren(grids.shape[-1], args.upscale,
-    #               args.n_hidden_layers, args.hidden_dim)
     model = nn.DataParallel(model).cuda()
-    # print(model)
 
     n_params = sum([p.numel() for p in model.parameters()])
-    n_bits = model.module.get_bit_size() # 16 * n_params
+    n_bits = model.module.get_bit_size()
     kbps = n_bits / (n_samples / rate) / 1000
     print(f'Model Params: {2*n_params/1e6:.4f}MB (kbps: {kbps:.4f})')
     print(f'avg bits per param: {n_bits / n_params:.4f}')
 
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    scheduler = get_cos_warmup_scheduler(optimizer, args.epochs,
-                                         0) # int(0.2*args.epochs))
+    scheduler = get_cos_warmup_scheduler(optimizer, args.epochs, 0)
     scaler = torch.cuda.amp.GradScaler()
 
     # 3. Train
@@ -125,7 +125,6 @@ def train(args):
     best_score = 0
 
     for epoch in tqdm.tqdm(range(start_epoch, args.epochs)):
-        # iterate over dataloader
         for i in torch.randperm(len(grids)).cuda().split(args.batch_size):
             optimizer.zero_grad()
 
@@ -145,6 +144,9 @@ def train(args):
             scaler.update()
 
         scheduler.step()
+
+        if args.debug and (epoch == args.epochs - 1):
+            import pdb; pdb.set_trace()
 
         # evaluation
         if (epoch + 1) % args.eval_freq == 0:
@@ -168,7 +170,7 @@ def train(args):
     print(f'{kbps:.3f} {scores[0].cpu().numpy():.3f} {scores[1]:.3f} '
           f'{args.n_hidden_layers} {args.hidden_dim} {args.n_bits} '
           f'my(2) {args.upscale} {args.lr} cos {args.batch_size} {args.epochs}')
-    # torchaudio.save('recon.wav', model(grids).cpu().reshape(1, -1), rate)
+    torchaudio.save('recon.wav', model(grids).cpu().reshape(1, -1), rate)
 
 
 @torch.no_grad()
