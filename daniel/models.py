@@ -6,6 +6,73 @@ import torch.nn.functional as F
 from utils import *
 
 
+class Grid(nn.Module):
+    def __init__(self, grid_resolution, bitwidth=6, code_size=4):
+        super().__init__()
+        self.grid_resolution = grid_resolution
+        self.bitwidth = bitwidth
+        self.code_size = code_size
+
+        self.codebook = nn.Parameter(
+            0.01 * torch.randn(2**bitwidth, code_size), requires_grad=True)
+        self.indices = nn.Parameter(
+            0.01 * torch.randn(grid_resolution, 2**bitwidth),
+            requires_grad=True)
+
+    def forward(self, coords):
+        # coords: values in between [-1, 1]
+        # grid: [grid_resolution, code_size]
+        soft_grid = F.softmax(self.indices, dim=-1) @ self.codebook
+        max_grid = torch.index_select(self.codebook, 0,
+                                      torch.argmax(self.indices, dim=1))
+        grid = (max_grid - soft_grid).detach() + soft_grid
+
+        coords = (coords + 1) / 2 * (self.grid_resolution - 1)
+
+        left = torch.floor(coords).clamp(max=self.grid_resolution-2).int()
+        right = torch.ceil(coords).clamp(min=1).int()
+        weight = (coords - left).unsqueeze(-1)
+
+        return (1-weight) * torch.index_select(grid, 0, left) \
+                + weight * torch.index_select(grid, 0, right)
+
+    def get_bit_size(self):
+        return 16 * self.codebook.numel() + self.grid_resolution * self.bitwidth
+
+
+class GridVINR(nn.Module):
+    def __init__(self, in_dim, out_dim, n_hidden_layers=3,
+                 hidden_dim=64, activation='gelu', n_bits=8):
+        super().__init__()
+        self.n_hidden_layers = n_hidden_layers
+
+        code_size = 4
+        self.grids = nn.ModuleList([Grid(2**i, code_size=code_size)
+                                    for i in [9, 11]])
+
+        net = [QALinear(in_dim + code_size, hidden_dim, n_bits=n_bits)]
+
+        for i in range(n_hidden_layers):
+            net.append(get_activation_fn(activation))
+            net.append(QALinear(hidden_dim, hidden_dim, n_bits=n_bits))
+
+        net.extend([get_activation_fn(activation),
+                    QALinear(hidden_dim, out_dim, n_bits=n_bits)])
+
+        self.net = nn.Sequential(*net)
+
+    def forward(self, inputs):
+        inputs = torch.cat([
+            sum([g(inputs[..., -1]) for g in self.grids]), inputs[..., :-1]],
+            -1)
+        return torch.tanh(self.net(inputs))
+
+    def get_bit_size(self):
+        return sum([0 if not hasattr(l, 'get_bit_size') else l.get_bit_size()
+                    for l in self.net]) \
+               + sum([g.get_bit_size() for g in self.grids])
+
+
 class VINR(nn.Module):
     '''
     Assumptions
@@ -31,7 +98,7 @@ class VINR(nn.Module):
         return torch.tanh(self.net(inputs))
 
     def get_bit_size(self):
-        return sum([0 if not isinstance(l, QALinear) else l.get_bit_size()
+        return sum([0 if not hasattr(l, 'get_bit_size') else l.get_bit_size()
                     for l in self.net])
 
 
@@ -44,11 +111,11 @@ class QALinear(nn.Module):
         self.quant_axis = quant_axis
 
         self.weight = nn.Parameter(
-            2 * torch.rand(in_dim, out_dim) / np.sqrt(in_dim)
-            - 1 / np.sqrt(in_dim), requires_grad=True)
+            (2 * torch.rand(in_dim, out_dim) - 1) / (in_dim**0.5),
+            requires_grad=True)
         self.bias = nn.Parameter(
-            2 * torch.rand(out_dim) / np.sqrt(in_dim)
-            - 1 / np.sqrt(in_dim), requires_grad=True)
+            (2 * torch.rand(out_dim) - 1) / (in_dim**0.5),
+            requires_grad=True)
 
     def forward(self, inputs):
         # quantize
