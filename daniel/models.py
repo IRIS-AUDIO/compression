@@ -7,11 +7,13 @@ from utils import *
 
 
 class Grid(nn.Module):
-    def __init__(self, grid_resolution, bitwidth=6, code_size=4):
+    def __init__(self, grid_resolution, bitwidth=6, code_size=4,
+                 cubic_interpolation=False):
         super().__init__()
         self.grid_resolution = grid_resolution
         self.bitwidth = bitwidth
         self.code_size = code_size
+        self.cubic_interpolation = cubic_interpolation
 
         self.codebook = nn.Parameter(
             0.01 * torch.randn(2**bitwidth, code_size), requires_grad=True)
@@ -33,8 +35,21 @@ class Grid(nn.Module):
         right = torch.ceil(coords).clamp(min=1).int()
         weight = (coords - left).unsqueeze(-1)
 
-        return (1-weight) * torch.index_select(grid, 0, left) \
-                + weight * torch.index_select(grid, 0, right)
+        left_value = torch.index_select(grid, 0, left)
+        right_value = torch.index_select(grid, 0, right)
+
+        if not self.cubic_interpolation:
+            return (1-weight) * left_value + weight * right_value
+
+        l_left = torch.floor(coords-1) \
+                      .clamp(min=0, max=self.grid_resolution-3).int()
+        r_right = torch.ceil(coords+1) \
+                       .clamp(min=2, max=self.grid_resolution-1).int()
+
+        l_left_value = torch.index_select(grid, 0, l_left)
+        r_right_value = torch.index_select(grid, 0, r_right)
+
+        return left_value + 0.5 * weight * (right_value - l_left_value + weight * (2 * l_left_value - 5 * left_value + 4 * right_value - r_right_value + weight * (3 * (left_value - right_value) + r_right_value - l_left_value)))
 
     def get_bit_size(self):
         return 16 * self.codebook.numel() + self.grid_resolution * self.bitwidth
@@ -42,15 +57,22 @@ class Grid(nn.Module):
 
 class GridVINR(nn.Module):
     def __init__(self, in_dim, out_dim, n_hidden_layers=3,
-                 hidden_dim=64, activation='gelu', n_bits=8):
+                 hidden_dim=64, activation='gelu', n_bits=8, grid_reduce='sum'):
         super().__init__()
         self.n_hidden_layers = n_hidden_layers
+        self.grid_reduce = grid_reduce
 
-        code_size = 4
-        self.grids = nn.ModuleList([Grid(2**i, code_size=code_size)
-                                    for i in [9, 11]])
+        self.grids = nn.ModuleList([Grid(2**i, code_size=c)
+                                    for i, c in [[7, 4], [9, 4], [11, 4]]])
 
-        net = [QALinear(in_dim + code_size, hidden_dim, n_bits=n_bits)]
+        if grid_reduce == 'sum':
+            first_size = in_dim + self.grids[0].code_size
+        elif grid_reduce == 'cat':
+            first_size = in_dim + sum([g.code_size for g in self.grids])
+        else:
+            raise ValueError(f'invalid grid_reduce: {grid_reduce}')
+
+        net = [QALinear(first_size, hidden_dim, n_bits=n_bits)]
 
         for i in range(n_hidden_layers):
             net.append(get_activation_fn(activation))
@@ -62,9 +84,13 @@ class GridVINR(nn.Module):
         self.net = nn.Sequential(*net)
 
     def forward(self, inputs):
-        inputs = torch.cat([
-            sum([g(inputs[..., -1]) for g in self.grids]), inputs[..., :-1]],
-            -1)
+        if self.grid_reduce == 'sum':
+            inputs = torch.cat([sum([g(inputs[..., -1]) for g in self.grids]),
+                                inputs[..., :-1]], -1)
+        else:
+            inputs = torch.cat([torch.cat([g(inputs[..., -1])
+                                           for g in self.grids], -1),
+                                inputs[..., :-1]], -1)
         return torch.tanh(self.net(inputs))
 
     def get_bit_size(self):

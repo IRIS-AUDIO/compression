@@ -19,6 +19,8 @@ parser = argparse.ArgumentParser()
 # dataset parameters
 parser.add_argument('--audio', type=str, default='all_mono.wav',
                     help='the path for the audio')
+parser.add_argument('--audio_len', type=float, default=10.,
+                    help='the length of the final audio (secs)')
 parser.add_argument('--name', required=True)
 parser.add_argument('--out_folder', default='compressed',
                     help='folder to output images and model checkpoints')
@@ -70,7 +72,7 @@ def train(args):
     if len(audio) % rate:
         audio = audio[:-(len(audio) % rate)]
     assert len(audio) % args.upscale == 0
-    audio = audio[:rate*10] # 30]
+    audio = audio[:int(rate*args.audio_len)]
     n_samples = audio.shape[0]
 
     # 1.2 audio preprocessing
@@ -83,11 +85,14 @@ def train(args):
     grids = torch.linspace(-1, 1, len(audio))
     grids = torch.stack([np.pi * grids * (2**i) for i in range(n_channels)], -1)
     grids = torch.cat([torch.cos(grids), torch.sin(grids)], -1)
+    # for GridVINR
+    grids = torch.cat([grids,
+                       torch.linspace(-1, 1, len(audio)).unsqueeze(-1)], -1)
     grids = grids.cuda()
     print(grids.shape)
 
     # 2. Model
-    metrics = [PSNR(), PESQ(rate)]
+    metrics = [PSNR()] # , PESQ(rate)]
     start_epoch = 0
 
     # 2.1 model width
@@ -103,10 +108,12 @@ def train(args):
         args.hidden_dim = int(np.round(float(max(solve(eq)))/2)*2)
         print(f'width: {args.hidden_dim}')
 
-    model = VINR(grids.shape[-1], args.upscale,
-                 n_hidden_layers=args.n_hidden_layers,
-                 hidden_dim=args.hidden_dim, activation=args.activation,
-                 n_bits=args.n_bits)
+    # model = VINR(grids.shape[-1], args.upscale,
+    model = GridVINR(grids.shape[-1]-1, args.upscale,
+                     n_hidden_layers=args.n_hidden_layers,
+                     hidden_dim=args.hidden_dim, activation=args.activation,
+                     n_bits=args.n_bits)
+    print(model)
     model = nn.DataParallel(model).cuda()
 
     n_params = sum([p.numel() for p in model.parameters()])
@@ -166,7 +173,7 @@ def train(args):
     if args.save:
         torch.save(checkpoint, f'{args.out_folder}/latest.pth')
 
-    print(f'{kbps:.3f} {scores[0].cpu().numpy():.3f} {scores[1]:.3f} '
+    print(f'{kbps:.3f} {scores[0].cpu().numpy():.3f} ' # {scores[1]:.3f} '
           f'{args.n_hidden_layers} {args.hidden_dim} {args.n_bits} '
           f'my(2) {args.upscale} {args.lr} cos {args.batch_size} {args.epochs}')
     torchaudio.save('recon.wav', model(grids).cpu().reshape(1, -1), rate)
